@@ -1,0 +1,167 @@
+//@version=5
+indicator("CRT Liquidity Sweep MTF Screener (H1 & H4)", overlay=true, max_labels_count=500, max_lines_count=500)
+
+// =============================================================================
+// INPUT PENGATURAN
+// =============================================================================
+group_crt       = "Pengaturan Candle Range Theory (CRT)"
+min_body_pct    = input.float(60.0, "Minimal Body Acuan (%)", minval=10.0, maxval=90.0, step=5.0, group=group_crt, tooltip="Filter ekspansi: Body candle acuan minimal X% dari total range (High - Low) agar tidak dianggap doji.")
+
+group_tf        = "Multi-Timeframe Aktif"
+enable_h1       = input.bool(true, "Aktifkan Analisis H1", group=group_tf)
+enable_h4       = input.bool(true, "Aktifkan Analisis H4", group=group_tf)
+
+group_visual    = "Visual & Tampilan Chart"
+show_labels     = input.bool(true, "Tampilkan Label Sinyal di Chart", group=group_visual)
+show_dashboard  = input.bool(true, "Tampilkan Tabel Status (Dashboard)", group=group_visual)
+dash_pos        = input.string("Top Right", "Posisi Dashboard", options=["Top Right", "Bottom Right", "Top Left", "Bottom Left"], group=group_visual)
+
+// =============================================================================
+// LOGIKA CUSTOM FUNCTION ANTI-REPAINTING CRT
+// =============================================================================
+// Fungsi ini dirancang untuk dijalankan di dalam request.security().
+// Menggunakan index [2] untuk Candle Acuan dan [1] untuk Candle Trigger.
+// Keduanya sudah 100% CLOSED (selesai terbentuk), menjamin TIDAK ADA REPAINTING.
+f_cek_crt(float body_threshold) =>
+    // Candle Acuan (Reference Candle) - 2 candle ke belakang
+    o_ref = open[2]
+    h_ref = high[2]
+    l_ref = low[2]
+    c_ref = close[2]
+    
+    // Candle Trigger (Sweep Candle) - 1 candle ke belakang (candle terakhir yang SUDAH TUTUP)
+    o_trig = open[1]
+    h_trig = high[1]
+    l_trig = low[1]
+    c_trig = close[1]
+    
+    // 1. Filter Ekspansi Candle Acuan
+    range_ref   = h_ref - l_ref
+    body_ref    = math.abs(c_ref - o_ref)
+    is_expansion = (range_ref > 0) and ((body_ref / range_ref) >= (body_threshold / 100.0))
+    
+    is_bull_ref = c_ref > o_ref
+    is_bear_ref = c_ref < o_ref
+    
+    // 2. Setup SELL (Sweep High):
+    //    - Candle acuan Bullish & Ekspansi (Body > threshold)
+    //    - Candle Trigger menyapu High acuan (High > High acuan)
+    //    - Candle Trigger Close di BAWAH High acuan dan di ATAS Low acuan (Gagal tembus / Sweep)
+    sweep_high = (h_trig > h_ref) and (c_trig < h_ref) and (c_trig > l_ref)
+    sell_valid = is_expansion and is_bull_ref and sweep_high
+    
+    // 3. Setup BUY (Sweep Low):
+    //    - Candle acuan Bearish & Ekspansi (Body > threshold)
+    //    - Candle Trigger menyapu Low acuan (Low < Low acuan)
+    //    - Candle Trigger Close di ATAS Low acuan dan di BAWAH High acuan (Gagal tembus / Sweep)
+    sweep_low = (l_trig < l_ref) and (c_trig > l_ref) and (c_trig < h_ref)
+    buy_valid = is_expansion and is_bear_ref and sweep_low
+    
+    // Sinyal numerik: 1 = BUY, -1 = SELL, 0 = NETRAL
+    signal_code = buy_valid ? 1 : (sell_valid ? -1 : 0)
+    
+    // Mengembalikan tuple: [sinyal, waktu_candle_trigger, high_acuan, low_acuan]
+    [signal_code, time[1], h_ref, l_ref]
+
+// =============================================================================
+// REQUEST SECURITY MULTI-TIMEFRAME (H1 & H4)
+// =============================================================================
+// barmerge.lookahead_off dan barmerge.gaps_off menjaga sinkronisasi histori secara presisi
+[h1_sig, h1_time, h1_href, h1_lref] = request.security(
+     syminfo.tickerid, "60", f_cek_crt(min_body_pct), 
+     barmerge.gaps_off, barmerge.lookahead_off
+ )
+
+[h4_sig, h4_time, h4_href, h4_lref] = request.security(
+     syminfo.tickerid, "240", f_cek_crt(min_body_pct), 
+     barmerge.gaps_off, barmerge.lookahead_off
+ )
+
+// Deteksi saat pergantian bar higher timeframe (agar notifikasi M5 hanya keluar 1x saat bar HTF tutup)
+h1_is_new_bar = ta.change(h1_time) != 0
+h4_is_new_bar = ta.change(h4_time) != 0
+
+// Trigger Event Sinyal (Hanya terpicu 1 bar saat candle HTF resmi tutup)
+h1_buy_now  = enable_h1 and h1_is_new_bar and (h1_sig == 1)
+h1_sell_now = enable_h1 and h1_is_new_bar and (h1_sig == -1)
+
+h4_buy_now  = enable_h4 and h4_is_new_bar and (h4_sig == 1)
+h4_sell_now = enable_h4 and h4_is_new_bar and (h4_sig == -1)
+
+// =============================================================================
+// PENGIRIMAN ALERT JSON OTOMATIS (WEBHOOK COMPATIBLE)
+// =============================================================================
+// Fungsi helper untuk menghasilkan string JSON rapi
+f_create_payload(string tf, string sinyal, string pesan, float price) =>
+    '{"simbol": "' + syminfo.ticker + '", ' +
+    '"tf": "' + tf + '", ' +
+    '"sinyal": "' + sinyal + '", ' +
+    '"harga": ' + str.tostring(price, "#.##") + ', ' +
+    '"pesan": "' + pesan + '"}'
+
+// Trigger Alert H1
+if h1_buy_now
+    msg_h1_buy = f_create_payload("H1", "BUY", "CRT Sweep Low Valid. Cek konfirmasi M5!", close)
+    alert(msg_h1_buy, alert.freq_once_per_bar_close)
+
+if h1_sell_now
+    msg_h1_sell = f_create_payload("H1", "SELL", "CRT Sweep High Valid. Cek konfirmasi M5!", close)
+    alert(msg_h1_sell, alert.freq_once_per_bar_close)
+
+// Trigger Alert H4
+if h4_buy_now
+    msg_h4_buy = f_create_payload("H4", "BUY", "CRT H4 Sweep Low Valid! Peluang Reversal Besar. Cek M5!", close)
+    alert(msg_h4_buy, alert.freq_once_per_bar_close)
+
+if h4_sell_now
+    msg_h4_sell = f_create_payload("H4", "SELL", "CRT H4 Sweep High Valid! Peluang Reversal Besar. Cek M5!", close)
+    alert(msg_h4_sell, alert.freq_once_per_bar_close)
+
+// Alertcondition formal (opsional jika user memilih Alert Condition spesifik dari menu UI)
+alertcondition(h1_buy_now or h4_buy_now, title="CRT BUY Signal (H1/H4)", message='{"simbol": "{{ticker}}", "tf": "MTF", "sinyal": "BUY", "pesan": "CRT Sweep Low Valid!"}')
+alertcondition(h1_sell_now or h4_sell_now, title="CRT SELL Signal (H1/H4)", message='{"simbol": "{{ticker}}", "tf": "MTF", "sinyal": "SELL", "pesan": "CRT Sweep High Valid!"}')
+
+// =============================================================================
+// VISUALISASI CHART
+// =============================================================================
+// Label Sinyal di Bar M5
+if show_labels
+    if h1_buy_now
+        label.new(bar_index, low, text="H1 CRT BUY\n(Sweep Low)", color=color.green, textcolor=color.white, style=label.style_label_up, size=size.small)
+    if h1_sell_now
+        label.new(bar_index, high, text="H1 CRT SELL\n(Sweep High)", color=color.red, textcolor=color.white, style=label.style_label_down, size=size.small)
+    if h4_buy_now
+        label.new(bar_index, low, text="🔥 H4 CRT BUY\n(Sweep Low)", color=color.teal, textcolor=color.white, style=label.style_label_up, size=size.normal)
+    if h4_sell_now
+        label.new(bar_index, high, text="🔥 H4 CRT SELL\n(Sweep High)", color=color.maroon, textcolor=color.white, style=label.style_label_down, size=size.normal)
+
+// Dashboard Status Mini di Sudut Layar
+var table_position = position.top_right
+if dash_pos == "Bottom Right"
+    table_position := position.bottom_right
+else if dash_pos == "Top Left"
+    table_position := position.top_left
+else if dash_pos == "Bottom Left"
+    table_position := position.bottom_left
+
+var table dash = table.new(table_position, 3, 3, bgcolor=color.new(color.black, 20), border_width=1, border_color=color.gray)
+
+if barstate.islast and show_dashboard
+    // Header
+    table.cell(dash, 0, 0, "Timeframe", bgcolor=color.navy, text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 0, "Status CRT", bgcolor=color.navy, text_color=color.white, text_size=size.small)
+    table.cell(dash, 2, 0, "Kondisi", bgcolor=color.navy, text_color=color.white, text_size=size.small)
+    
+    // Baris H1
+    string h1_status = h1_sig == 1 ? "BUY (Sweep Low)" : (h1_sig == -1 ? "SELL (Sweep High)" : "MENUNGGU")
+    color h1_col     = h1_sig == 1 ? color.green : (h1_sig == -1 ? color.red : color.gray)
+    table.cell(dash, 0, 1, "H1 (1 Jam)", bgcolor=color.black, text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 1, h1_status, bgcolor=h1_col, text_color=color.white, text_size=size.small)
+    table.cell(dash, 2, 1, enable_h1 ? "Aktif" : "Non-aktif", bgcolor=color.black, text_color=color.silver, text_size=size.small)
+    
+    // Baris H4
+    string h4_status = h4_sig == 1 ? "BUY (Sweep Low)" : (h4_sig == -1 ? "SELL (Sweep High)" : "MENUNGGU")
+    color h4_col     = h4_sig == 1 ? color.teal : (h4_sig == -1 ? color.maroon : color.gray)
+    table.cell(dash, 0, 2, "H4 (4 Jam)", bgcolor=color.black, text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 2, h4_status, bgcolor=h4_col, text_color=color.white, text_size=size.small)
+    table.cell(dash, 2, 2, enable_h4 ? "Aktif" : "Non-aktif", bgcolor=color.black, text_color=color.silver, text_size=size.small)
